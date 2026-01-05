@@ -61,21 +61,7 @@ The tool generates a `forensic_report_[CaseID]_[Timestamp].json` file containing
 *   **HPA Analysis**: Reported vs. Native Max LBA coordinates.
 *   **Data Integrity**: SHA-256 hash of the first sector of the hidden area.
 
----
 
-## ❓ Frequently Asked Questions (FAQ)
-
-**Q: Is it safe to run on my main OS?**
-> **A:** Yes. The script is 100% read-only. It does not write to your disk or modify your filesystem.
-
-**Q: Why does it need Administrator/Root privileges?**
-> **A:** Accessing raw disk sectors and sending ATA commands bypasses the OS security layer, which requires elevated permissions.
-
-**Q: Will the "Unlock" feature permanently change my drive?**
-> **A:** No. The unlock is **volatile**. It only changes a temporary flag in the drive's RAM that resets automatically when you reboot.
-
-**Q: What if the script fails to identify my drive?**
-> **A:** This usually happens if the drive is behind a USB bridge that doesn't support ATA Pass-Through. For best results, use a direct SATA/NVMe connection or a high-quality forensic bridge.
 
 ---
 
