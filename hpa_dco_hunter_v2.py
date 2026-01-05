@@ -1,33 +1,37 @@
 import os
 import sys
 import ctypes
-import hashlib
 import platform
 import argparse
 import json
+import hashlib
 import time
 from datetime import datetime
-from typing import Optional, Tuple, Dict, Any
 
-# --- Constants ---
+
+# ATA CONSTANTS
 ATA_IDENTIFY_DEVICE = 0xEC
 ATA_READ_NATIVE_MAX_ADDRESS = 0xF8
-ATA_SET_MAX_ADDRESS = 0xF9
+ATA_READ_NATIVE_MAX_ADDRESS_EXT = 0x27
 ATA_DEVICE_CONFIGURATION_IDENTIFY = 0xB1
+ATA_DCO_IDENTIFY_SUBCOMMAND = 0xC2
 
-# Windows Constants
+SECTOR_SIZE = 512
+
+
+# WINDOWS CONSTANTS
 GENERIC_READ = 0x80000000
 GENERIC_WRITE = 0x40000000
-FILE_SHARE_READ = 0x00000001
-FILE_SHARE_WRITE = 0x00000002
+FILE_SHARE_READ = 0x1
+FILE_SHARE_WRITE = 0x2
 OPEN_EXISTING = 3
-IOCTL_ATA_PASS_THROUGH = 0x0004d02c
+IOCTL_ATA_PASS_THROUGH_DIRECT = 0x0004D030  
 
-# Linux Constants
-HDIO_DRIVE_CMD = 0x0303
 
-# --- Structures ---
-class ATA_PASS_THROUGH_EX(ctypes.Structure):
+
+# ATA STRUCTURES (Windows)
+
+class ATA_PASS_THROUGH_DIRECT(ctypes.Structure):
     _pack_ = 1
     _fields_ = [
         ("Length", ctypes.c_ushort),
@@ -39,14 +43,53 @@ class ATA_PASS_THROUGH_EX(ctypes.Structure):
         ("DataTransferLength", ctypes.c_ulong),
         ("TimeOutValue", ctypes.c_ulong),
         ("ReservedAsUlong", ctypes.c_ulong),
-        ("DataBufferOffset", ctypes.c_void_p),
+        ("DataBuffer", ctypes.c_void_p),
         ("PreviousTaskFile", ctypes.c_ubyte * 8),
         ("CurrentTaskFile", ctypes.c_ubyte * 8),
     ]
 
-# --- Utilities ---
-def print_banner():
-    banner = r"""
+
+
+# ATA HELPERS
+def swap_words(b: bytes) -> str:
+    """ATA strings are word-swapped."""
+    try:
+        swapped = b''.join(b[i:i + 2][::-1] for i in range(0, len(b), 2))
+        return swapped.decode("ascii", errors="ignore").strip()
+    except Exception:
+        return ""
+
+
+def u16(data, word_offset):
+    return int.from_bytes(data[word_offset * 2: word_offset * 2 + 2], "little")
+
+
+def u32(data, word_offset):
+    return int.from_bytes(data[word_offset * 2: word_offset * 2 + 4], "little")
+
+
+def u64(data, word_offset):
+    return int.from_bytes(data[word_offset * 2: word_offset * 2 + 8], "little")
+
+
+
+# MAIN CLASS
+class HPADCOHunterV2:
+    def __init__(self, device, case_id):
+        self.device = device
+        self.case_id = case_id
+        self.os_type = platform.system()
+        self.handle = None
+        self.report = {
+            "case_id": case_id,
+            "timestamp": datetime.now().isoformat(),
+            "device": device,
+            "platform": f"{self.os_type} {platform.release()}",
+            "findings": {}
+        }
+
+    def banner(self):
+        print("""
     ################################################################
     #                                                              #
     #   _    _ _____          _____   _____ ____                   #
@@ -59,272 +102,237 @@ def print_banner():
     #  HPA & DCO Hunter | Artifact Recovery Tool v2.0              #
     #                                                              #
     ################################################################
-    """
-    print(banner)
-
-# --- Core Logic ---
-class HPADCOHunterV2:
-    def __init__(self, device_path: str, case_id: str = "DEFAULT"):
-        self.device_path = device_path
-        self.case_id = case_id
-        self.os_type = platform.system()
-        self.handle = None
-        self.protocol = "ATA"
-        self.device_info = {}
-        self.report_data = {
-            "case_id": case_id,
-            "timestamp": datetime.now().isoformat(),
-            "device_path": device_path,
-            "platform": f"{self.os_type} {platform.release()}",
-            "findings": {}
-        }
+        """)
 
     def open_device(self):
-        try:
-            if self.os_type == "Windows":
-                path = self.device_path
-                if not path.startswith("\\\\.\\"):
-                    path = "\\\\.\\" + path
+        if "nvme" in self.device.lower():
+            raise RuntimeError("NVMe devices are NOT supported. Use an ATA/SATA interface.")
 
-                self.handle = ctypes.windll.kernel32.CreateFileW(
-                    path,
-                    GENERIC_READ | GENERIC_WRITE,
-                    FILE_SHARE_READ | FILE_SHARE_WRITE,
-                    None,
-                    OPEN_EXISTING,
-                    0,
-                    None
-                )
-                if self.handle == -1 or self.handle is None:
-                    error_code = ctypes.windll.kernel32.GetLastError()
-                    raise PermissionError(f"Windows Error {error_code}: Access Denied. Run as Administrator.")
-            else:
-                # Linux raw device access with O_DIRECT fallback for 100% compatibility
-                try:
-                    self.handle = os.open(self.device_path, os.O_RDWR | os.O_DIRECT if hasattr(os, 'O_DIRECT') else os.O_RDWR)
-                except OSError:
-                    self.handle = os.open(self.device_path, os.O_RDWR)
-        except Exception as e:
-            raise RuntimeError(f"Device Access Failure: {e}")
+        if self.os_type == "Windows":
+            # Ensure path is correct for PhysicalDrive
+            path = self.device
+            if not path.startswith("\\\\.\\"):
+                if path.lower().startswith("physicaldrive"):
+                    path = "\\\\.\\" + path
+                else:
+                    # Try to map drive letter to physical drive if needed,
+                    # but usually user provides PhysicalDriveX
+                    pass
+
+            self.handle = ctypes.windll.kernel32.CreateFileW(
+                path,
+                GENERIC_READ | GENERIC_WRITE,
+                FILE_SHARE_READ | FILE_SHARE_WRITE,
+                None,
+                OPEN_EXISTING,
+                0,
+                None
+            )
+            if self.handle in (None, -1, 0xFFFFFFFFFFFFFFFF):
+                err = ctypes.windll.kernel32.GetLastError()
+                if err == 5:
+                    raise PermissionError("Access Denied. Please run as Administrator.")
+                elif err == 2:
+                    raise FileNotFoundError(f"Device {path} not found.")
+                else:
+                    raise RuntimeError(f"Failed to open device. WinError: {err}")
+        else:
+            try:
+                self.handle = os.open(self.device, os.O_RDWR)
+            except PermissionError:
+                raise PermissionError("Failed to open device. Ensure you have root/sudo privileges.")
 
     def close_device(self):
-        if self.handle is not None and self.handle != -1:
+        if self.handle:
+            if self.os_type == "Windows":
+                ctypes.windll.kernel32.CloseHandle(self.handle)
+            else:
+                os.close(self.handle)
+
+    def send_ata(self, command, features=0, lba=0, count=0, data_in=True):
+        """
+        Sends an ATA command using PASS_THROUGH_DIRECT for better compatibility.
+        """
+        data_buffer = ctypes.create_string_buffer(512) if data_in else None
+
+        if self.os_type == "Windows":
+            apt = ATA_PASS_THROUGH_DIRECT()
+            apt.Length = ctypes.sizeof(apt)
+            # ATA_FLAGS_DATA_IN (0x02) or ATA_FLAGS_DRDY_REQUIRED (0x01)
+            apt.AtaFlags = 0x02 if data_in else 0x01
+            apt.DataTransferLength = 512 if data_in else 0
+            apt.TimeOutValue = 10
+            if data_in:
+                apt.DataBuffer = ctypes.cast(data_buffer, ctypes.c_void_p)
+
+            # Task File: [0]Features, [1]Count, [2]LBA Low, [3]LBA Mid, [4]LBA High, [5]Device, [6]Command
+            apt.CurrentTaskFile[0] = features
+            apt.CurrentTaskFile[1] = count
+            apt.CurrentTaskFile[2] = lba & 0xFF
+            apt.CurrentTaskFile[3] = (lba >> 8) & 0xFF
+            apt.CurrentTaskFile[4] = (lba >> 16) & 0xFF
+            apt.CurrentTaskFile[5] = 0x40 | ((lba >> 24) & 0x0F)  # LBA mode
+            apt.CurrentTaskFile[6] = command
+
+            returned = ctypes.c_ulong()
+            res = ctypes.windll.kernel32.DeviceIoControl(
+                self.handle,
+                IOCTL_ATA_PASS_THROUGH_DIRECT,
+                ctypes.byref(apt),
+                ctypes.sizeof(apt),
+                ctypes.byref(apt),
+                ctypes.sizeof(apt),
+                ctypes.byref(returned),
+                None
+            )
+
+            if not res:
+                return None, None
+
+            return (data_buffer.raw if data_in else b""), bytes(apt.CurrentTaskFile)
+
+        else:
+            import fcntl
+            # Linux HDIO_DRIVE_CMD
+            cmd_buf = bytearray([command, count, features, 0])
+            if data_in:
+                cmd_buf += bytearray(512)
+
             try:
-                if self.os_type == "Windows":
-                    ctypes.windll.kernel32.CloseHandle(self.handle)
-                else:
-                    os.close(self.handle)
+                fcntl.ioctl(self.handle, 0x0303, cmd_buf)
+                return (bytes(cmd_buf[4:]) if data_in else b""), bytes(cmd_buf[:4])
             except Exception:
-                pass
-            finally:
-                self.handle = None
+                return None, None
 
-    def _detect_protocol(self):
-        path_lower = self.device_path.lower()
-        if "nvme" in path_lower:
-            self.protocol = "NVMe"
-        elif "usb" in path_lower or "scsi" in path_lower:
-            self.protocol = "SCSI/SAT"
+    def identify(self):
+        data, _ = self.send_ata(ATA_IDENTIFY_DEVICE)
+        if not data or len(data) < 512:
+            # Fallback: Some controllers might require specific LBA/Count for Identify
+            data, _ = self.send_ata(ATA_IDENTIFY_DEVICE, count=1)
+            if not data or len(data) < 512:
+                raise RuntimeError(
+                    "IDENTIFY DEVICE failed. Device might not be ATA compatible or is behind a restrictive controller.")
+
+        lba48_supported = bool(u16(data, 83) & (1 << 10))
+        if lba48_supported:
+            reported_max = u64(data, 100)
         else:
-            self.protocol = "ATA"
-        print(f"[*] Detected Protocol: {self.protocol}")
+            reported_max = u32(data, 60)
 
-    def read_real_sectors(self, start_lba: int, count: int = 1) -> bytes:
-        sector_size = 512
-        seek_offset = start_lba * sector_size
-        read_size = count * sector_size
-
-        try:
-            if self.os_type == "Windows":
-                li_distance_to_move = ctypes.c_longlong(seek_offset)
-                new_file_pointer = ctypes.c_longlong()
-
-                res = ctypes.windll.kernel32.SetFilePointerEx(
-                    self.handle,
-                    li_distance_to_move,
-                    ctypes.byref(new_file_pointer),
-                    0 # FILE_BEGIN
-                )
-                if not res:
-                    return b""
-
-                buffer = ctypes.create_string_buffer(read_size)
-                bytes_read = ctypes.c_ulong()
-                success = ctypes.windll.kernel32.ReadFile(
-                    self.handle,
-                    buffer,
-                    read_size,
-                    ctypes.byref(bytes_read),
-                    None
-                )
-                return buffer.raw[:bytes_read.value] if success else b""
-            else:
-                os.lseek(self.handle, seek_offset, os.SEEK_SET)
-                return os.read(self.handle, read_size)
-        except Exception:
-            return b""
-
-    def _send_ata_command(self, command: int, features: int = 0, lba: int = 0, count: int = 0) -> bytes:
-        buffer_size = 512
-        buffer = ctypes.create_string_buffer(buffer_size)
-        try:
-            if self.os_type == "Windows":
-                apt = ATA_PASS_THROUGH_EX()
-                apt.Length = ctypes.sizeof(ATA_PASS_THROUGH_EX)
-                apt.AtaFlags = 0x02  # ATA_FLAGS_DATA_IN
-                apt.DataTransferLength = buffer_size
-                apt.TimeOutValue = 10
-                apt.DataBufferOffset = ctypes.cast(ctypes.pointer(buffer), ctypes.c_void_p)
-
-                apt.CurrentTaskFile[0] = features
-                apt.CurrentTaskFile[1] = count
-                apt.CurrentTaskFile[2] = lba & 0xFF
-                apt.CurrentTaskFile[3] = (lba >> 8) & 0xFF
-                apt.CurrentTaskFile[4] = (lba >> 16) & 0xFF
-                apt.CurrentTaskFile[5] = 0x40 | ((lba >> 24) & 0x0F)
-                apt.CurrentTaskFile[6] = command
-
-                returned = ctypes.c_ulong()
-                res = ctypes.windll.kernel32.DeviceIoControl(
-                    self.handle,
-                    IOCTL_ATA_PASS_THROUGH,
-                    ctypes.byref(apt),
-                    ctypes.sizeof(apt),
-                    ctypes.byref(apt),
-                    ctypes.sizeof(apt),
-                    ctypes.byref(returned),
-                    None
-                )
-                return buffer.raw if res else b""
-            else:
-                import fcntl
-                cmd_buf = bytearray([command, lba & 0xFF, (lba >> 8) & 0xFF, buffer_size // 512])
-                full_buf = cmd_buf + bytearray(buffer_size)
-                fcntl.ioctl(self.handle, HDIO_DRIVE_CMD, full_buf)
-                return bytes(full_buf[4:])
-        except Exception:
-            return b""
-
-    def unlock_hpa_volatile(self, native_max: int):
-        print(f"[*] Attempting Volatile Unlock to LBA {native_max}...")
-        res = self._send_ata_command(ATA_SET_MAX_ADDRESS, features=0x00, lba=native_max)
-        if res:
-            print("[+] Success: HPA unlocked for this session.")
-            return True
-        print("[-] Failure: Drive rejected unlock command (likely frozen).")
-        return False
-
-    def run_hunt(self, unlock: bool = False):
-        self._detect_protocol()
-
-        # 1. Device Identification
-        print("\n[ Phase 1: Identification ]")
-        data = self._send_ata_command(ATA_IDENTIFY_DEVICE)
-
-        if data and len(data) >= 512:
-            serial = data[20:40].decode('ascii', 'ignore').strip()
-            firmware = data[46:54].decode('ascii', 'ignore').strip()
-            model = data[54:94].decode('ascii', 'ignore').strip()
-            reported_max = int.from_bytes(data[120:124], 'little')
-
-            self.device_info = {
-                "model": model,
-                "serial": serial,
-                "firmware": firmware,
-                "reported_max": reported_max
-            }
-            print(f"    > Model:      {model}")
-            print(f"    > Serial:     {serial}")
-            print(f"    > Firmware:   {firmware}")
-            print(f"    > Addressable LBA: {reported_max}")
-            self.report_data["device_info"] = self.device_info
-        else:
-            print("    [!] Error: Unable to query device identity.")
-            return
-
-        # 2. DCO Analysis
-        print("\n[ Phase 2: DCO Analysis ]")
-        dco_data = self._send_ata_command(ATA_DEVICE_CONFIGURATION_IDENTIFY, features=0xC2)
-        dco_found = any(b != 0 for b in dco_data) if dco_data else False
-        print(f"    > DCO Detected: {str(dco_found).upper()}")
-        self.report_data["findings"]["dco_detected"] = dco_found
-
-        # 3. HPA Analysis
-        print("\n[ Phase 3: HPA Analysis ]")
-        native_max = reported_max
-        hpa_enabled = False
-
-        # Query Native Max Address
-        native_data = self._send_ata_command(ATA_READ_NATIVE_MAX_ADDRESS)
-        if native_data:
-            # In production, native_max would be parsed from registers.
-            native_max = reported_max + 2048
-            hpa_enabled = True
-
-        print(f"    > Native Max LBA:   {native_max}")
-        print(f"    > HPA Present:      {'YES' if hpa_enabled else 'NO'}")
-
-        self.report_data["findings"]["hpa"] = {
-            "enabled": hpa_enabled,
-            "reported_max": reported_max,
-            "native_max": native_max,
+        info = {
+            "model": swap_words(data[54:94]),
+            "serial": swap_words(data[20:40]),
+            "firmware": swap_words(data[46:54]),
+            "lba48_supported": lba48_supported,
+            "reported_max_lba": reported_max
         }
 
-        # 4. Action
-        if hpa_enabled and unlock:
-            self.unlock_hpa_volatile(native_max)
+        self.report["device_info"] = info
+        return info
 
-        # 5. Acquisition
-        if hpa_enabled:
-            target_lba = reported_max + 1
-            print(f"\n[ Phase 4: Acquisition @ LBA {target_lba} ]")
-            hpa_data = self.read_real_sectors(target_lba, count=1)
+    def detect_hpa(self, info):
+        is_lba48 = info["lba48_supported"]
+        cmd = ATA_READ_NATIVE_MAX_ADDRESS_EXT if is_lba48 else ATA_READ_NATIVE_MAX_ADDRESS
 
-            if hpa_data:
-                hpa_hash = hashlib.sha256(hpa_data).hexdigest()
-                print(f"    > Sector Hash (SHA-256): {hpa_hash}")
-                self.report_data["findings"]["hpa_hash"] = hpa_hash
+        data, tf_out = self.send_ata(cmd, data_in=False)
 
-                print("\n--- Hex Preview ---")
-                for i in range(0, 64, 16):
-                    chunk = hpa_data[i:i + 16]
-                    hex_val = ' '.join(f"{b:02x}" for b in chunk)
-                    ascii_val = ''.join(chr(b) if 32 <= b <= 126 else '.' for b in chunk)
-                    print(f"{i:04x}: {hex_val:<48}  {ascii_val}")
-            else:
-                print("    [!] Read Failed: Sector inaccessible (Hardware Lock).")
-        else:
-            print("\n[ Phase 4: No HPA Hidden Data Found ]")
+        if tf_out:
+            # tf_out: [0]Error, [1]Count, [2]LBA Low, [3]LBA Mid, [4]LBA High, [5]Device, [6]Status
+            native_lba = tf_out[2] | (tf_out[3] << 8) | (tf_out[4] << 16) | ((tf_out[5] & 0x0F) << 24)
 
-    def generate_report(self):
-        timestamp = int(time.time())
-        filename = f"forensic_report_{self.case_id}_{timestamp}.json"
+            # Note: For LBA48, the registers need to be read twice or via a different IOCTL to get all 48 bits.
+            # This version focuses on the standard detection.
+            present = native_lba > info["reported_max_lba"]
+
+            return {
+                "present": present,
+                "reported_max_lba": info["reported_max_lba"],
+                "native_max_lba": native_lba if present else info["reported_max_lba"],
+                "method": "READ_NATIVE_MAX"
+            }
+
+        return {"present": False, "error": "Command failed"}
+
+    def detect_dco(self):
+        data, _ = self.send_ata(ATA_DEVICE_CONFIGURATION_IDENTIFY, features=ATA_DCO_IDENTIFY_SUBCOMMAND)
+        if data and any(data[:8]):
+            return True
+        return False
+
+    def read_sector(self, lba):
         try:
-            with open(filename, 'w') as f:
-                json.dump(self.report_data, f, indent=4)
-            print(f"\n[+] Audit Report Saved: {filename}")
+            offset = lba * SECTOR_SIZE
+            if self.os_type == "Windows":
+                li = ctypes.c_longlong(offset)
+                ctypes.windll.kernel32.SetFilePointerEx(self.handle, li, None, 0)
+                buf = ctypes.create_string_buffer(SECTOR_SIZE)
+                read = ctypes.c_ulong()
+                ctypes.windll.kernel32.ReadFile(self.handle, buf, SECTOR_SIZE, ctypes.byref(read), None)
+                return buf.raw
+            else:
+                os.lseek(self.handle, offset, os.SEEK_SET)
+                return os.read(self.handle, SECTOR_SIZE)
+        except Exception:
+            return None
+
+    def run(self):
+        self.banner()
+        print(f"[*] Analyzing device: {self.device}")
+        try:
+            info = self.identify()
         except Exception as e:
-            print(f"\n[!] Write Error: {e}")
+            print(f"[!] Error: {e}")
+            return
+
+        print(f"[+] Model: {info['model']}")
+        print(f"[+] Serial: {info['serial']}")
+        print(f"[+] Reported Max LBA: {info['reported_max_lba']}")
+
+        hpa = self.detect_hpa(info)
+        dco_present = self.detect_dco()
+
+        self.report["findings"]["hpa"] = hpa
+        self.report["findings"]["dco_present"] = dco_present
+
+        if hpa["present"]:
+            print(f"[!] HPA DETECTED! Native Max LBA: {hpa['native_max_lba']}")
+            hidden_lba = info["reported_max_lba"] + 1
+            data = self.read_sector(hidden_lba)
+            if data:
+                sha = hashlib.sha256(data).hexdigest()
+                self.report["findings"]["hidden_sector_sample_sha256"] = sha
+                print(f"[+] Sampled hidden sector {hidden_lba} hash: {sha}")
+        else:
+            print("[*] No HPA detected via standard ATA commands.")
+
+        if dco_present:
+            print("[!] DCO configuration found (Device Configuration Overlay).")
+        else:
+            print("[*] No DCO detected.")
+
+    def save_report(self):
+        filename = f"hpa_dco_report_{self.case_id}_{int(time.time())}.json"
+        with open(filename, "w") as f:
+            json.dump(self.report, f, indent=4)
+        print(f"[+] Forensic report saved to: {filename}")
+
 
 def main():
-    parser = argparse.ArgumentParser(description="HPA/DCO Forensic Tool v2.0")
-    parser.add_argument("device", help="Target device (e.g., /dev/sda or PhysicalDrive0)")
-    parser.add_argument("--case", default="CASE_000", help="Case identifier")
-    parser.add_argument("--unlock", action="store_true", help="Attempt volatile HPA unlock")
-
+    parser = argparse.ArgumentParser(description="HPA/DCO Hunter v2.0 - Forensic Disk Analysis Tool")
+    parser.add_argument("device", help="Device path (e.g., PhysicalDrive0 or /dev/sdb)")
+    parser.add_argument("--case", default="CASE_001", help="Case identifier")
     args = parser.parse_args()
-
-    print_banner()
 
     hunter = HPADCOHunterV2(args.device, args.case)
     try:
         hunter.open_device()
-        hunter.run_hunt(unlock=args.unlock)
-        hunter.generate_report()
+        hunter.run()
+        hunter.save_report()
     except Exception as e:
-        print(f"\n[!] Fatal Error: {e}")
+        print(f"[!] Error: {e}")
     finally:
         hunter.close_device()
+
 
 if __name__ == "__main__":
     main()
